@@ -20,7 +20,7 @@ c = [10]#[2,5,10,20]
 v_max = 50000
 # zeta = 2
 
-# axes_s.plot(t, 0.01*t, label='Linear')
+axes_s.plot(t, 0.01*t, label='Linear')
 # axes_s.plot(t, 0.1*4000*log(t), label='Log')
 # axes_s.plot(t,0.1*v_max * power(t,10) / (power(t,10) + power(v_max/2,10)), label='Sigmoid')
 for zeta in c:
