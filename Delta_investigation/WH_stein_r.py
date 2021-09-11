@@ -10,12 +10,12 @@ import random
 pyplot.figure(figsize=(10,10), dpi=100)
 
 # make a subplot for the susceptible, infected and recovered individuals
-axes_s = pyplot.subplot(211, title='Effect of growth parameter r on viral load curve', yscale='log', ylim=(0.1,999999))
+axes_s = pyplot.subplot(111, title='Effect of growth parameter r on viral load curve')#, yscale='log', ylim=(0.1,999999))
 # axes_s = pyplot.subplot(211)
 axes_s.set_ylabel("Viral Load")
 
-axes_i = pyplot.subplot(212)
-axes_i.set_ylabel("P(Transmission)")
+# axes_i = pyplot.subplot(212)
+# axes_i.set_ylabel("P(Transmission)")
 
 # axes_r = pyplot.subplot(313)
 # axes_r.set_ylabel("P(Transmission)")
@@ -29,7 +29,7 @@ init_v = 100
 
 detect_threshold = 10000
 
-t = linspace(0, 24, num=24 * steps_per_day)
+t = linspace(0, 10, num=10 * steps_per_day)
 # y = linspace(1,10000,2)
 # y = [1,10,100,1000,10000]
 y = [4.5,14.2,45,142.2,450]
@@ -91,12 +91,12 @@ for j in rs:
             threshold_infect.append(0)
 
     axes_s.plot(t, solution[0], label='r = ' + str(j) + ', AUC = ' + str(round(area,2)))
-    axes_i.plot(t, lin_infect, label='r = ' + str(j))
+    # axes_i.plot(t, lin_infect, label='r = ' + str(j))
     # axes_r.plot(t, threshold_infect, label='r = ' + str(j) + ' : Infectious duration = ' + str(round(sum(threshold_infect),2)) + ' days')
 
 
 axes_s.legend()
-axes_i.legend()
+# axes_i.legend()
 # axes_r.legend()
 
 pyplot.savefig(fname='WH_stein')

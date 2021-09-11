@@ -11,21 +11,22 @@ pyplot.figure(figsize=(10,10), dpi=100)
 
 # make a subplot for the susceptible, infected and recovered individuals
 # axes_s = pyplot.subplot(311, yscale='log', ylim=(0.1,999999))
-axes_s = pyplot.subplot(311)
+axes_s = pyplot.subplot(111, title='Within-host response to varying initial viral loads (V0)')
 axes_s.set_ylabel("Viral Load")
+axes_s.set_xlabel("Days")
 
-axes_i = pyplot.subplot(312)
-axes_i.set_ylabel("P(Transmission)")
+# axes_i = pyplot.subplot(312)
+# axes_i.set_ylabel("P(Transmission)")
 
-axes_r = pyplot.subplot(313)
-axes_r.set_ylabel("P(Transmission)")
-axes_r.set_xlabel("Days")
+# axes_r = pyplot.subplot(313)
+# axes_r.set_ylabel("P(Transmission)")
+# axes_r.set_xlabel("Days")
 
 steps_per_day = 30
 
 zeta = 10
 
-t = linspace(0, 24, num=24 * steps_per_day)
+t = linspace(0, 16, num=16 * steps_per_day)
 # y = linspace(1,10000,2)
 # y = [1,10,100,1000,10000]
 y = [4.5,14.2,45,142.2,450]
@@ -70,31 +71,36 @@ for j in y:
     lin_infect = [sim/(v_max * steps_per_day) for sim in solution[0]]
     
     threshold_infect = []
-    threshold = 10000
-    # threshold = 13432
+    threshold_auc = []
+    threshold = 5000
+    # threshold = 20000
     ptrans = 1.0 / steps_per_day
     
     for sim in solution[0]:
         if sim>threshold:
             threshold_infect.append(ptrans)
+            threshold_auc.append(sim)
         else:
             threshold_infect.append(0)
+            threshold_auc.append(0)
+
+    area_inf = auc(t,threshold_auc)
 
     # rec_init = [(0.01*v_max * power(t,zeta) / (power(t,zeta) + power(v_max/2,zeta))) for t in solution[0]]
 
 #     print(j,len(where(array(solution[2]) > 100)[0]))
     
-    axes_s.plot(t, solution[0], label='V0 = ' + str(j) + ', AUC = ' + str(round(area,2)))
+    axes_s.plot(t, solution[0], label='V0 = ' + str(j))# + ', AUC = ' + str(round(area_inf,2)))
     # axes_i.plot(t, solution[2], label='V0 = ' + str(j))
-    axes_i.plot(t, lin_infect, label='V0 = ' + str(j))
-    axes_r.plot(t, threshold_infect, label='V0 = ' + str(j) + ' : Infectious duration = ' + str(round(sum(threshold_infect),2)) + ' days')
+    # axes_i.plot(t, lin_infect, label='V0 = ' + str(j))
+    # axes_r.plot(t, threshold_infect, label='V0 = ' + str(j) + ' : Infectious duration = ' + str(round(sum(threshold_infect),2)) + ' days')
     # axes_r.plot(t, rec_init, label='V0 = ' + str(j))
 
 # axes_s.axhline(45000, linestyle='--', label='V = 45000', color='red')
 
 axes_s.legend()
-axes_i.legend()
-axes_r.legend()
+# axes_i.legend()
+# axes_r.legend()
 
 # solution = odeint(differential_TIV, y0, t, args=(alpha, beta, prod, clear))
 # solution = [[row[i] for row in solution] for i in range(3)]

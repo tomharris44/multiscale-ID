@@ -6,25 +6,29 @@ import pylab as plt
 import matplotlib.pyplot as ptr
 import matplotlib as mpl
 import enum
+import math
 from scipy.integrate import odeint
-from scipy.stats import pearsonr, spearmanr
+from scipy.stats import pearsonr, spearmanr, poisson
 from mesa import Agent, Model
 from mesa.time import RandomActivation
 from mesa.space import MultiGrid
 from mesa.datacollection import DataCollector
-
 import networkx as nx
-
+import seaborn as sns
 from multiprocessing import Pool
 
 steps_per_day = 30
+viral_load_max = 50000
+
+p_trans_div = viral_load_max * steps_per_day
+
 
 class InfectionMultiscaleModel(Model):
     """A model for infection spread."""
 
     def __init__(self, N=10, steps_per_day = 2,
-                 v_threshold=300000, G='constant',
-                 con_init=5, lin_init=1, log_init=1,
+                 v_threshold=300000, G='constant', F='linear',
+                 con_init=5, lin_init=1, log_init=1, ind_init=5,
                  sig_init=1, delay=0, output_tree=None):
 
         self.num_agents = N
@@ -33,30 +37,42 @@ class InfectionMultiscaleModel(Model):
         self.lin_init = lin_init
         self.log_init = log_init
         self.sig_init = sig_init
+        self.ind_init = ind_init
         self.delay = delay
         self.schedule = RandomActivation(self)
         self.running = True
         self.dead_agents = []
         self.G = G
+        self.F = F
         self.r0 = 0
         self.ptrans = 1.0 / steps_per_day
-        self.viral_load_max = 25000
+        self.viral_load_max = viral_load_max
         self.inoc_max = 50000
         self.inoc_max_sig = np.power(self.inoc_max/2,self.sig_init)
         self.infected = 0
+        self.removed = 0
         self.viral_load_tree = dict()
 
+        self.sig_infector_multiplier = self.lin_init * self.inoc_max
+        self.sig_ptrans_multiplier = self.inoc_max / p_trans_div
+
+        self.con_ptrans_multiplier = self.sig_ptrans_multiplier / 2
+
         if G == 'constant':
-            self.v_threshold = v_threshold
+            # self.v_threshold = 1 / self.lin_init
+            self.v_threshold = 5000
         elif G == 'random':
-            self.v_threshold = 1 / self.lin_init
+            # self.v_threshold = 1 / self.lin_init
+            self.v_threshold = 5000
         elif G == 'linear':
-            self.v_threshold = 1 / self.lin_init
+            # self.v_threshold = 1 / self.lin_init
+            self.v_threshold = 5000
         elif G == 'log':
             self.v_threshold = np.exp(1 / (self.log_init * self.inoc_max))
         elif G == 'sigmoid':
             beta = self.lin_init * self.inoc_max
             self.v_threshold = np.power(self.inoc_max_sig/(beta * (1 - (1/beta))),1/self.sig_init) - self.delay
+            # self.v_threshold = 5000
         
         print(self.lin_init,self.sig_init,self.v_threshold)
 
@@ -66,7 +82,7 @@ class InfectionMultiscaleModel(Model):
             self.schedule.add(a)
             if i == 1:
                 a.state = MSState.INFECTED
-                a.infection_course = a.infect_stein_init('constant',a.unique_id,1,1)
+                a.infection_course = a.infect_stein_init('constant',a.unique_id,self.ind_init,1)
 
         self.datacollector = DataCollector(
             model_reporters={"r0" : "r0",
@@ -124,18 +140,23 @@ class MSMyAgent(Agent):
         if G == 'constant':
             init_v = self.model.con_init
         elif G == 'random':
-            init_v = self.random.randint(1,450)
+            init_v = self.random.randint(1,499)
         elif G == 'bottleneck':
             init_v = np.minimum(1, donor * 0.000001)
         elif G == 'linear':
-            init_v = self.model.lin_init * donor
+            # init_v = self.model.lin_init * donor
+            foo = self.model.lin_init * donor
+            init_v = np.mean(poisson.rvs(foo, size=100))
         elif G == 'log':
             init_v = self.model.log_init * np.log(donor)
         elif G == 'sigmoid':
-            init_v = self.model.lin_init * self.model.inoc_max * np.power(donor + self.model.delay,self.model.sig_init) / (np.power(donor + self.model.delay,self.model.sig_init) + self.model.inoc_max_sig)
+            # init_v = self.model.lin_init * self.model.inoc_max * np.power(donor + self.model.delay,self.model.sig_init) / (np.power(donor + self.model.delay,self.model.sig_init) + self.model.inoc_max_sig)
+            foo = self.model.sig_infector_multiplier * np.power(donor + self.model.delay,self.model.sig_init) / (np.power(donor + self.model.delay,self.model.sig_init) + self.model.inoc_max_sig)
+            init_v = np.mean(poisson.rvs(foo, size=100))
 
-        self.model.infected += 1
-        self.model.viral_load_tree[(donor_id,self.unique_id)] = (donor_init_v,init_v,donor,self.infection_time)
+        # if init_v < 1:
+        #     print('V0 less than 1 found')
+        #     init_v = 1
 
         self.init_v = init_v
             
@@ -143,6 +164,11 @@ class MSMyAgent(Agent):
         
         solution = odeint(differential_stein, y0, t, args=(r,kI,kN,kP,aI,aN,aP,bI,dN,c,kV,KI,tN,tP))
         solution = [[row[i] for row in solution] for i in range(4)]
+
+        exp_time = get_exposed_period(solution[0],self.model.v_threshold)
+
+        self.model.infected += 1
+        self.model.viral_load_tree[(donor_id,self.unique_id)] = (donor_init_v,init_v,donor,self.infection_time, exp_time)
 
         return solution
 
@@ -167,7 +193,7 @@ class MSMyAgent(Agent):
         p0 = 2
         
         if G == 'constant':
-            init_v = self.model.con_init
+            init_v = self.model.ind_init
         elif G == 'random':
             init_v = self.random.randint(1,3000000)
         elif G == 'bottleneck':
@@ -177,7 +203,7 @@ class MSMyAgent(Agent):
         elif G == 'log':
             init_v = self.model.log_init * np.log(donor)
         elif G == 'sigmoid':
-            init_v = self.model.lin_init * self.model.inoc_max * np.power(donor + self.model.delay,self.model.sig_init) / (np.power(donor + self.model.delay,self.model.sig_init) + self.model.inoc_max_sig)
+            init_v = self.model.sig_infector_multiplier * np.power(donor + self.model.delay,self.model.sig_init) / (np.power(donor + self.model.delay,self.model.sig_init) + self.model.inoc_max_sig)
 
         self.model.infected += 1
         # self.model.viral_load_tree[(donor_id,self.unique_id)] = (donor_init_v,init_v,donor)
@@ -196,9 +222,11 @@ class MSMyAgent(Agent):
 
         if self.state == MSState.INFECTED: 
             t = self.model.schedule.time-self.infection_time
+            # if self.infection_course[0][t] < 1:
             if self.infection_course[0][t] < 1:
                 self.state = MSState.REMOVED
                 self.model.infected -= 1
+                self.model.removed += 1
 
 
     def contact(self):
@@ -208,19 +236,34 @@ class MSMyAgent(Agent):
             cellmates = self.random.sample(self.model.schedule.agents,k=1)
             t = self.model.schedule.time-self.infection_time
             if t>0:
-                var_ptrans = self.infection_course[0][t] / (self.model.viral_load_max * self.model.steps_per_day)
+                var_ptrans = self.get_ptrans(self.infection_course[0][t], self.model.F)
                 for other in cellmates:
-                    if other.state is MSState.SUSCEPTIBLE and self.infection_course[0][t] > self.model.v_threshold and self.random.random() < var_ptrans: 
-                    # if other.state is MSState.SUSCEPTIBLE and self.infection_course[0][t] > model.v_threshold and self.random.random() < self.model.ptrans:                    
+                    # if other.state is MSState.SUSCEPTIBLE and self.infection_course[0][t] > self.model.v_threshold and self.random.random() < var_ptrans:                 
+                    if other.state is MSState.SUSCEPTIBLE and self.random.random() < var_ptrans:                 
                         other.state = MSState.INFECTED
                         other.infection_time = self.model.schedule.time
                         other.infection_course = other.infect_stein(model.G,self.unique_id,self.infection_course[0][t],self.init_v)
                         if self.unique_id == 1:
                             self.model.r0 += 1
+                        # print(self.init_v,var_ptrans,self.infection_course[0][t],other.init_v)
                     
     def step(self):
         self.status()
         self.contact()
+
+
+    def get_ptrans(self,V,F):
+        if V < self.model.v_threshold:
+            return 0
+        if F == 'linear':
+            return V / p_trans_div
+        if F == 'sigmoid':
+            return self.model.sig_ptrans_multiplier * np.power(V,self.model.sig_init) / (np.power(V,self.model.sig_init) + np.power(self.model.inoc_max/2,self.model.sig_init))
+        if F == 'random':
+            return self.random.random() * self.model.sig_ptrans_multiplier
+        if F == 'constant':
+            return self.model.con_ptrans_multiplier
+        
 
 def get_column_data(model):
     """pivot the model dataframe to get states count at each step"""
@@ -252,33 +295,12 @@ def get_column_data(model):
         X['Incidence Days'].loc[i] = i
     return X
 
-def get_peak_viral_load(init):
-    t = np.linspace(0, 12, num=12 * steps_per_day)
-    y0 = ()
-    r = 8
-    kI = 0.05
-    kN = 0.5
-    kP = 2
-    aI = 0.000000001
-    aN = 0.00000001
-    aP = 0.000005
-    bI = 2
-    dN = 0.05
-    c = 0.01
-    kV = 100000000000
-    KI = 100
-    tN = 2.5
-    tP = 3
-    n0 = 0
-    p0 = 2
+def get_exposed_period(V, threshold):
+    for i in range(len(V)):
+        if V[i] > threshold:
+            return i
 
-    y0 = (init, 0, n0, p0)
-        
-    solution = odeint(differential_stein, y0, t, args=(r,kI,kN,kP,aI,aN,aP,bI,dN,c,kV,KI,tN,tP))
-    solution = [[row[i] for row in solution] for i in range(4)]
-
-    return max(solution[0])
-
+    return None
 
 def get_all_lengths_gen(G,root):
 
@@ -319,9 +341,9 @@ def get_avg_length_time(G,root,tree):
 
 
 
-days = 100
+days = 300
 steps = steps_per_day * days
-pop = 10000
+pop = 5000
 
 ptr.close("all")
 
@@ -329,27 +351,33 @@ data_whole = pd.DataFrame()
 
 # SUBTREE ANALYSIS
 
-# z = [('sigmoid', 0, 'blue', '', 10), ('linear', 0, 'blue', '', 10), ('random', 0, 'blue', '', 10)]
-z = [('linear', 0, 'blue', '', 10), ('random', 0, 'blue', '', 10)]
+ptrans_funcs = ['constant', 'sigmoid', 'linear', 'random']
+# ptrans_funcs = ['sigmoid']
+# Dv_Rv_funcs = ['constant',  'sigmoid', 'linear', 'random']
+Dv_Rv_funcs = ['random']
+
+z = [[a, b, 450] for b in ptrans_funcs for a in Dv_Rv_funcs]
+
+print(z)
 
 no_sims = 1
 
 ptr.figure(figsize=(10,10), dpi=100)
 
-for j, d, col, per, s in z:
+for j, f, init in z:
 
     data_whole = pd.DataFrame()
     r0s_inner = []
     for i in range(no_sims):
         print("Sim: " + str(i))
         while(True):
-            model = InfectionMultiscaleModel(pop, steps_per_day=steps_per_day, v_threshold=10000, G=j, con_init=450, sig_init=s, delay=d, lin_init=0.01, log_init=400)
+            model = InfectionMultiscaleModel(pop, steps_per_day=steps_per_day, v_threshold=10000, G=j, ind_init=init, con_init=250, sig_init=10, delay=0, lin_init=0.01, log_init=400, F=f)
             for i in range(steps):
                 model.step()
                 if model.infected == 0:
                     model.step()
                     break
-            if model.r0 != 0:
+            if model.r0 != 0 and model.removed > 1500:
                 break
 
         data = get_column_data(model)
@@ -360,38 +388,38 @@ for j, d, col, per, s in z:
 
         print(max(data_whole['Removed']))
 
-        # data_hist = data_whole['Viral Load Tree']
-        # data_hist = data_hist[data_hist.astype(bool)]
+        data_hist = data_whole['Viral Load Tree']
+        data_hist = data_hist[data_hist.astype(bool)]
 
-        # length = 5
-        # width = 5
+        length = 5
+        width = 5
 
-        # size = length * width
+        size = length * width
 
-        # v_max = 500
-        # j_add = v_max / size
-        # i_add = width * j_add
+        v_max = 500
+        j_add = v_max / size
+        i_add = width * j_add
         
-        # for i in range(5):
-        #     for h in range(5):
-        #         lower = i_add*i + j_add*h
-        #         upper = i_add*i + j_add*(h+1)
+        for i in range(5):
+            for h in range(5):
+                lower = i_add*i + j_add*h
+                upper = i_add*i + j_add*(h+1)
                 
-        #         vals = [(list(k.values())[0][0],list(k.values())[0][1]) for k in data_hist if (list(k.values())[0][0] > lower) & (list(k.values())[0][0] <= upper)]
+                vals = [(list(k.values())[0][0],list(k.values())[0][1]) for k in data_hist if (list(k.values())[0][0] > lower) & (list(k.values())[0][0] <= upper)]
 
-        #         dons = [i[0] for i in vals]
-        #         recs = [i[1] for i in vals]
+                dons = [i[0] for i in vals]
+                recs = [i[1] for i in vals]
 
-        #         ax = ptr.subplot2grid((5,5), (i,h), title='Donor V0 range: ' + str(int(lower)) + ' - ' + str(int(upper)), xlabel='Recipient V0', ylim=(0,50))
-        #         ax.hist(recs,bins=20,range=(0,500))
+                ax = ptr.subplot2grid((5,5), (i,h), title='Donor V0 range: ' + str(int(lower)) + ' - ' + str(int(upper)), xlabel='Recipient V0', ylim=(0,50))
+                ax.hist(recs,bins=20,range=(0,500))
 
 
-    # ptr.tight_layout()
+    ptr.tight_layout()
 
-    # ptr.savefig(fname='hist')
+    ptr.savefig(fname='hist' + j + '_' + f)
     # ptr.show()
 
-    # ptr.close("all")
+    ptr.close("all")
 
     # ptr.figure(figsize=(15,10), dpi=100)
 
@@ -463,9 +491,11 @@ for j, d, col, per, s in z:
 
     ptr.close("all")
 
+    ptr.figure(figsize=(10,10), dpi=100)
+
     ax = plt.subplot(111)
     tree = nx.DiGraph()
-    ax.set_title('Transmission Tree')
+    ax.set_title('Transmission Tree (Total #infections = ' + str(max(data_whole['Removed'])) + ' )')
     ax.set_xticks([])
 
     for i, row in data_whole.iterrows():
@@ -473,15 +503,18 @@ for j, d, col, per, s in z:
             for i in row['Viral Load Tree']:
                 if tree.number_of_nodes() < 10000:
                     if tree.has_node(i[0]):
-                        tree.add_node(i[1], init_v=round(row['Viral Load Tree'][i][1],2), time=round(row['Viral Load Tree'][i][3],2), gen=tree.nodes[i[0]]['gen'] + 1)
+                        tree.add_node(i[1], init_v=round(row['Viral Load Tree'][i][1],2), time=round(row['Viral Load Tree'][i][3],2), 
+                            gen=tree.nodes[i[0]]['gen'] + 1, exp=row['Viral Load Tree'][i][4])
                         tree.add_edge(i[0],i[1], rec_init=round(row['Viral Load Tree'][i][1],2))
                     else:
-                        tree.add_node(i[0], init_v=round(row['Viral Load Tree'][i][0],2), time=0, gen=0)
-                        tree.add_node(i[1], init_v=round(row['Viral Load Tree'][i][1],2), time=round(row['Viral Load Tree'][i][3],2), gen=tree.nodes[i[0]]['gen'] + 1)
+                        tree.add_node(i[0], init_v=round(row['Viral Load Tree'][i][0],2), time=0, gen=0, exp=None)
+                        tree.add_node(i[1], init_v=round(row['Viral Load Tree'][i][1],2), time=round(row['Viral Load Tree'][i][3],2), 
+                            gen=tree.nodes[i[0]]['gen'] + 1, exp=row['Viral Load Tree'][i][4])
                         tree.add_edge(i[0],i[1],rec_init=round(row['Viral Load Tree'][i][1],2)) 
 
     pos=nx.drawing.nx_agraph.graphviz_layout(tree, prog='dot')
     max_time = max([tree.nodes[i]['time'] for i in tree.nodes()])
+    max_gen = max([tree.nodes[i]['gen'] for i in tree.nodes()])
 
     for node in tree.nodes():
         pos[node] = (pos[node][0],-1*tree.nodes[node]['time'])
@@ -495,7 +528,7 @@ for j, d, col, per, s in z:
     
     ptr.colorbar(nodes)
 
-    yticks = range(0,-1*max_time,-100)
+    yticks = range(0,-1*max_time,(-3 * steps_per_day))
     labelsy = [ round(-1*i/steps_per_day) for i in yticks]
     
     ax.set_yticks(yticks)
@@ -509,30 +542,35 @@ for j, d, col, per, s in z:
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='trans_tree')
-    ptr.show()
+    ptr.savefig(fname='trans_tree_' + j + '_' + f)
+    # ptr.show()
 
     init_vs = []
+    init_vs_parents = []
     times = []
     generations = []
+    exps = []
     sizes = []
     lengths = []
     sec_cases = []
     GFs = []
     SLs = []
+    GIs = []
 
     binned_init_vs = []
-    bins_vs = np.linspace(0,500,num=11)
+    bins_vs = np.linspace(0,500,num=21)
     for g in bins_vs:
         binned_init_vs.append([])
 
     binned_time = []
-    bins_time = np.linspace(0,days,num=11)
+    bins_time = np.linspace(0,days,num=21)
     for g in bins_time:
         binned_time.append([])
 
     binned_gen = []
-    bins_gen = np.linspace(0,20,num=11)
+    # bins_gen = list(range(0,max_gen+3,2))
+    bins_gen = list(range(0,51,2))
+    # print(max_gen,bins_gen)
     for g in bins_gen:
         binned_gen.append([])
 
@@ -540,7 +578,17 @@ for j, d, col, per, s in z:
     for node in tree.nodes():
         # if tree.nodes[node]['time'] > 10*steps_per_day and tree.nodes[node]['time'] < 55*steps_per_day:
         sub = nx.dfs_tree(tree,node)
+        children = list(tree.successors(node))
+        GI = []
+        exp = None
+        # if children:
+        #     parent = parent[0]
+        # else:
+        #     parent = None
+
         bin_no_vs = np.digitize(tree.nodes[node]['init_v'],bins_vs)
+        # if bin_no_vs >= len(bins_vs):
+        #     print(tree.nodes[node]['init_v'], bin_no_vs, len(bins_vs))
         bin_no_time = np.digitize(tree.nodes[node]['time']/steps_per_day,bins_time)
         bin_no_gen = np.digitize(tree.nodes[node]['gen'],bins_gen)
 
@@ -548,19 +596,31 @@ for j, d, col, per, s in z:
         init_vs.append(tree.nodes[node]['init_v'])
         times.append(tree.nodes[node]['time']/steps_per_day)
         generations.append(tree.nodes[node]['gen'])
+        if tree.nodes[node]['exp']:
+            exp = tree.nodes[node]['exp']/steps_per_day
+            exps.append(tree.nodes[node]['exp']/steps_per_day)
 
         sizes.append(sub.size())
         lengths.append(get_avg_length_gen(sub,node))
         sec_cases.append(len(list(tree.successors(node))))
         GFs.append(np.mean([tree.nodes[i]['init_v'] for i in tree.successors(node)]) / tree.nodes[node]['init_v'])
         SLs.append(sub.size() / get_avg_length_gen(sub,node))
+        if children:
+            for i in children:
+                GIs.append((tree.nodes[i]['time'] - tree.nodes[node]['time']) / steps_per_day)
+                init_vs_parents.append(tree.nodes[node]['init_v'])
+        
+
 
         #binned data sets
-        binned_init_vs[bin_no_vs].append([sub.size(),get_avg_length_gen(sub,node),len(list(tree.successors(node))),np.mean([tree.nodes[i]['init_v'] for i in tree.successors(node)]) / tree.nodes[node]['init_v'], sub.size() / get_avg_length_gen(sub,node), get_avg_length_time(sub,node,tree)])
-        binned_time[bin_no_time].append([sub.size(),get_avg_length_gen(sub,node),len(list(tree.successors(node))),np.mean([tree.nodes[i]['init_v'] for i in tree.successors(node)]) / tree.nodes[node]['init_v'], sub.size() / get_avg_length_gen(sub,node), get_avg_length_time(sub,node,tree)])
-        binned_gen[bin_no_gen].append([sub.size(),get_avg_length_gen(sub,node),len(list(tree.successors(node))),np.mean([tree.nodes[i]['init_v'] for i in tree.successors(node)]) / tree.nodes[node]['init_v'], sub.size() / get_avg_length_gen(sub,node), get_avg_length_time(sub,node,tree)])
-        
-        
+        binned_init_vs[bin_no_vs].append([sub.size(),get_avg_length_gen(sub,node),len(list(tree.successors(node))),np.mean([tree.nodes[i]['init_v'] for i in tree.successors(node)]) / tree.nodes[node]['init_v'], 
+            sub.size() / get_avg_length_gen(sub,node), get_avg_length_time(sub,node,tree), exp, GI])
+        binned_time[bin_no_time].append([sub.size(),get_avg_length_gen(sub,node),len(list(tree.successors(node))),np.mean([tree.nodes[i]['init_v'] for i in tree.successors(node)]) / tree.nodes[node]['init_v'], 
+            sub.size() / get_avg_length_gen(sub,node), get_avg_length_time(sub,node,tree), exp, GI])
+        if bin_no_gen < len(binned_gen):
+            binned_gen[bin_no_gen].append([sub.size(),get_avg_length_gen(sub,node),len(list(tree.successors(node))),np.mean([tree.nodes[i]['init_v'] for i in tree.successors(node)]) / tree.nodes[node]['init_v'], 
+            sub.size() / get_avg_length_gen(sub,node), get_avg_length_time(sub,node,tree), exp, GI])
+           
 
     ptr.close("all")
 
@@ -570,7 +630,7 @@ for j, d, col, per, s in z:
 
     # SIZE
 
-    # ptr.figure(figsize=(7,10), dpi=100)
+    # ptr.figure(figsize=(14,10), dpi=100)
 
     # axes_a = ptr.subplot(311, yscale='log', title='Effect of V0 of root node on subtree size', xlim=(0,500), ylim=(0.1,pop))
     # axes_a.set_ylabel("Subtree size")
@@ -597,7 +657,7 @@ for j, d, col, per, s in z:
 
     # SIZE B+W NOTCH
 
-    ptr.figure(figsize=(7,10), dpi=100)
+    ptr.figure(figsize=(14,10), dpi=100)
 
     axes_a = ptr.subplot(311, yscale='log', title='Effect of V0 of root node on subtree size')
     axes_a.set_ylabel("Subtree size")
@@ -622,46 +682,54 @@ for j, d, col, per, s in z:
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='subtree_analysis')
-    ptr.show()
+    ptr.savefig(fname='size_bp_' + j + '_' + f)
+    # ptr.show()
 
     ptr.close("all")
 
-    # SIZE B+W
+    # SIZE striplot
 
-    ptr.figure(figsize=(7,10), dpi=100)
+    ptr.figure(figsize=(14,10), dpi=100)
 
-    axes_a = ptr.subplot(311, yscale='log', title='Effect of V0 of root node on subtree size')
+    axes_a = ptr.subplot(311, yscale='log', title='Effect of V0 of root node on subtree size', ylim=(0.1,10000))
     axes_a.set_ylabel("Subtree size")
     axes_a.set(xlabel="Initial Viral Load")
 
-    axes_b = ptr.subplot(312, yscale='log', title='Effect of time on subtree size')
+    axes_b = ptr.subplot(312, yscale='log', title='Effect of time on subtree size', ylim=(0.1,10000))
     axes_b.set_ylabel("Subtree size")
     axes_b.set(xlabel="Days")
 
-    axes_c = ptr.subplot(313, yscale='log', title='Effect of generation on subtree size')
+    axes_c = ptr.subplot(313, yscale='log', title='Effect of generation on subtree size', ylim=(0.1,10000))
     axes_c.set_ylabel("Subtree size")
     axes_c.set(xlabel="Generation")
 
     labs_vs = [str(int(bins_vs[h-1])) + '-' + str(int(bins_vs[h])) for h in range(1,len(bins_vs))]
     labs_time = [str(int(bins_time[h-1])) + '-' + str(int(bins_time[h])) for h in range(1,len(bins_time))]
     labs_gen = [str(int(bins_gen[h-1])) + '-' + str(int(bins_gen[h])) for h in range(1,len(bins_gen))]
-    
 
-    axes_a.boxplot([[h[0] for h in g] for g in binned_init_vs[1:]], labels=labs_vs)
-    axes_b.boxplot([[h[0] for h in g] for g in binned_time[1:]], labels=labs_time)
-    axes_c.boxplot([[h[0] for h in g] for g in binned_gen[1:]], labels=labs_gen)
+    sns.stripplot(data=[[h[0] for h in g] for g in binned_init_vs[1:]], ax=axes_a, jitter=0.4)
+    sns.despine()
+
+    sns.stripplot(data=[[h[0] for h in g] for g in binned_time[1:]], ax=axes_b, jitter=0.4)
+    sns.despine()
+
+    sns.stripplot(data=[[h[0] for h in g] for g in binned_gen[1:]], ax=axes_c, jitter=0.4)
+    sns.despine()
+
+    axes_a.set_xticklabels(labs_vs)
+    axes_b.set_xticklabels(labs_time)
+    axes_c.set_xticklabels(labs_gen)
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='subtree_analysis')
-    ptr.show()
+    ptr.savefig(fname='size_sp_' + j + '_' + f)
+    # ptr.show()
 
     ptr.close("all")
 
     # LENGTH
 
-    # ptr.figure(figsize=(7,10), dpi=100)
+    # ptr.figure(figsize=(14,10), dpi=100)
 
     # axes_a = ptr.subplot(311, title='Effect of V0 of root node on subtree path length', xlim=(0,500))
     # axes_a.set_ylabel("Path length")
@@ -688,7 +756,7 @@ for j, d, col, per, s in z:
 
     # LENGTH B+W NOTCH GEN
 
-    ptr.figure(figsize=(7,10), dpi=100)
+    ptr.figure(figsize=(14,10), dpi=100)
 
     axes_a = ptr.subplot(311, title='Effect of V0 of root node on subtree path length')
     axes_a.set_ylabel("Path length")
@@ -713,15 +781,15 @@ for j, d, col, per, s in z:
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='subtree_analysis')
-    ptr.show()
+    ptr.savefig(fname='len_gen_bw_' + j + '_' + f)
+    # ptr.show()
 
     ptr.close("all")
 
 
     # LENGTH B+W NOTCH TIME
 
-    ptr.figure(figsize=(7,10), dpi=100)
+    ptr.figure(figsize=(14,10), dpi=100)
 
     axes_a = ptr.subplot(311, title='Effect of V0 of root node on subtree path length')
     axes_a.set_ylabel("Path length")
@@ -746,14 +814,55 @@ for j, d, col, per, s in z:
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='subtree_analysis')
-    ptr.show()
+    ptr.savefig(fname='len_time_bw_' + j + '_' + f)
+    # ptr.show()
 
     ptr.close("all")
 
-    # LENGTH B+W GEN
+    # LENGTH striplot GEN
 
-    ptr.figure(figsize=(7,10), dpi=100)
+    ptr.figure(figsize=(14,10), dpi=100)
+
+    axes_a = ptr.subplot(311, title='Effect of V0 of root node on subtree path length')
+    axes_a.set_ylabel("Path length")
+    axes_a.set(xlabel="Initial Viral Load")
+
+    axes_b = ptr.subplot(312, title='Effect of time on subtree path length')
+    axes_b.set_ylabel("Path length")
+    axes_b.set(xlabel="Days")
+
+    axes_c = ptr.subplot(313, title='Effect of generation on subtree path length')
+    axes_c.set_ylabel("Path length")
+    axes_c.set(xlabel="Generation")
+
+    labs_vs = [str(int(bins_vs[h-1])) + '-' + str(int(bins_vs[h])) for h in range(1,len(bins_vs))]
+    labs_time = [str(int(bins_time[h-1])) + '-' + str(int(bins_time[h])) for h in range(1,len(bins_time))]
+    labs_gen = [str(int(bins_gen[h-1])) + '-' + str(int(bins_gen[h])) for h in range(1,len(bins_gen))]
+
+    sns.stripplot(data=[[h[1] for h in g] for g in binned_init_vs[1:]], ax=axes_a, jitter=0.4)
+    sns.despine()
+
+    sns.stripplot(data=[[h[1] for h in g] for g in binned_time[1:]], ax=axes_b, jitter=0.4)
+    sns.despine()
+
+    sns.stripplot(data=[[h[1] for h in g] for g in binned_gen[1:]], ax=axes_c, jitter=0.4)
+    sns.despine()
+
+    axes_a.set_xticklabels(labs_vs)
+    axes_b.set_xticklabels(labs_time)
+    axes_c.set_xticklabels(labs_gen)
+
+    ptr.tight_layout()
+
+    ptr.savefig(fname='len_gen_sp_' + j + '_' + f)
+    # ptr.show()
+
+    ptr.close("all")
+
+
+    # LENGTH striplot TIME
+
+    ptr.figure(figsize=(14,10), dpi=100)
 
     axes_a = ptr.subplot(311, title='Effect of V0 of root node on subtree path length')
     axes_a.set_ylabel("Path length")
@@ -771,48 +880,23 @@ for j, d, col, per, s in z:
     labs_time = [str(int(bins_time[h-1])) + '-' + str(int(bins_time[h])) for h in range(1,len(bins_time))]
     labs_gen = [str(int(bins_gen[h-1])) + '-' + str(int(bins_gen[h])) for h in range(1,len(bins_gen))]
     
+    sns.stripplot(data=[[h[5] for h in g] for g in binned_init_vs[1:]], ax=axes_a, jitter=0.4)
+    sns.despine()
 
-    axes_a.boxplot([[h[1] for h in g] for g in binned_init_vs[1:]], labels=labs_vs)
-    axes_b.boxplot([[h[1] for h in g] for g in binned_time[1:]], labels=labs_time)
-    axes_c.boxplot([[h[1] for h in g] for g in binned_gen[1:]], labels=labs_gen)
+    sns.stripplot(data=[[h[5] for h in g] for g in binned_time[1:]], ax=axes_b, jitter=0.4)
+    sns.despine()
 
-    ptr.tight_layout()
+    sns.stripplot(data=[[h[5] for h in g] for g in binned_gen[1:]], ax=axes_c, jitter=0.4)
+    sns.despine()
 
-    ptr.savefig(fname='subtree_analysis')
-    ptr.show()
-
-    ptr.close("all")
-
-
-    # LENGTH B+W TIME
-
-    ptr.figure(figsize=(7,10), dpi=100)
-
-    axes_a = ptr.subplot(311, title='Effect of V0 of root node on subtree path length')
-    axes_a.set_ylabel("Path length")
-    axes_a.set(xlabel="Initial Viral Load")
-
-    axes_b = ptr.subplot(312, title='Effect of time on subtree path length')
-    axes_b.set_ylabel("Path length")
-    axes_b.set(xlabel="Days")
-
-    axes_c = ptr.subplot(313, title='Effect of generation on subtree path length')
-    axes_c.set_ylabel("Path length")
-    axes_c.set(xlabel="Generation")
-
-    labs_vs = [str(int(bins_vs[h-1])) + '-' + str(int(bins_vs[h])) for h in range(1,len(bins_vs))]
-    labs_time = [str(int(bins_time[h-1])) + '-' + str(int(bins_time[h])) for h in range(1,len(bins_time))]
-    labs_gen = [str(int(bins_gen[h-1])) + '-' + str(int(bins_gen[h])) for h in range(1,len(bins_gen))]
-    
-
-    axes_a.boxplot([[h[5] for h in g] for g in binned_init_vs[1:]], labels=labs_vs)
-    axes_b.boxplot([[h[5] for h in g] for g in binned_time[1:]], labels=labs_time)
-    axes_c.boxplot([[h[5] for h in g] for g in binned_gen[1:]], labels=labs_gen)
+    axes_a.set_xticklabels(labs_vs)
+    axes_b.set_xticklabels(labs_time)
+    axes_c.set_xticklabels(labs_gen)
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='subtree_analysis')
-    ptr.show()
+    ptr.savefig(fname='len_time_sp_' + j + '_' + f)
+    # ptr.show()
 
     ptr.close("all")
 
@@ -820,7 +904,7 @@ for j, d, col, per, s in z:
 
     # SECONDARY CASE DISTRIBUTION
 
-    # ptr.figure(figsize=(7,10), dpi=100)
+    # ptr.figure(figsize=(14,10), dpi=100)
 
     # axes_a = ptr.subplot(311, title='Effect of V0 of root node on subtree secondary cases', xlim=(0,500))
     # axes_a.set_ylabel("Secondary Cases")
@@ -847,7 +931,7 @@ for j, d, col, per, s in z:
 
     # SECONDARY CASE DISTRIBUTION B+W
 
-    ptr.figure(figsize=(7,10), dpi=100)
+    ptr.figure(figsize=(14,10), dpi=100)
 
     axes_a = ptr.subplot(311, title='Effect of V0 of root node on subtree secondary cases')
     axes_a.set_ylabel("Secondary Cases")
@@ -864,11 +948,6 @@ for j, d, col, per, s in z:
     labs_vs = [str(int(bins_vs[h-1])) + '-' + str(int(bins_vs[h])) for h in range(1,len(bins_vs))]
     labs_time = [str(int(bins_time[h-1])) + '-' + str(int(bins_time[h])) for h in range(1,len(bins_time))]
     labs_gen = [str(int(bins_gen[h-1])) + '-' + str(int(bins_gen[h])) for h in range(1,len(bins_gen))]
-    
-
-    # axes_a.boxplot([[h for h in g] for g in nan_fil_inits], labels=labs_vs, notch=True)
-    # axes_b.boxplot([[h for h in g] for g in nan_fil_time], labels=labs_time, notch=True)
-    # axes_c.boxplot([[h for h in g] for g in nan_fil_gen], labels=labs_gen, notch=True)
 
     axes_a.boxplot([[h[2] for h in g] for g in binned_init_vs[1:]], labels=labs_vs, notch=True)
     axes_b.boxplot([[h[2] for h in g] for g in binned_time[1:]], labels=labs_time, notch=True)
@@ -876,15 +955,15 @@ for j, d, col, per, s in z:
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='subtree_analysis')
-    ptr.show()
+    ptr.savefig(fname='sec_cases_bw_' + j + '_' + f)
+    # ptr.show()
 
     ptr.close("all")
 
 
-    # SECONDARY CASE DISTRIBUTION B+W
+    # SECONDARY CASE DISTRIBUTION striplot
 
-    ptr.figure(figsize=(7,10), dpi=100)
+    ptr.figure(figsize=(14,10), dpi=100)
 
     axes_a = ptr.subplot(311, title='Effect of V0 of root node on subtree secondary cases')
     axes_a.set_ylabel("Secondary Cases")
@@ -902,25 +981,58 @@ for j, d, col, per, s in z:
     labs_time = [str(int(bins_time[h-1])) + '-' + str(int(bins_time[h])) for h in range(1,len(bins_time))]
     labs_gen = [str(int(bins_gen[h-1])) + '-' + str(int(bins_gen[h])) for h in range(1,len(bins_gen))]
     
+    sns.stripplot(data=[[h[2] for h in g] for g in binned_init_vs[1:]], ax=axes_a, jitter=0.4)  
+    sns.despine()
 
-    # axes_a.boxplot([[h for h in g] for g in nan_fil_inits], labels=labs_vs, notch=True)
-    # axes_b.boxplot([[h for h in g] for g in nan_fil_time], labels=labs_time, notch=True)
-    # axes_c.boxplot([[h for h in g] for g in nan_fil_gen], labels=labs_gen, notch=True)
+    sns.stripplot(data=[[h[2] for h in g] for g in binned_time[1:]], ax=axes_b, jitter=0.4)
+    sns.despine()
 
-    axes_a.boxplot([[h[2] for h in g] for g in binned_init_vs[1:]], labels=labs_vs)
-    axes_b.boxplot([[h[2] for h in g] for g in binned_time[1:]], labels=labs_time)
-    axes_c.boxplot([[h[2] for h in g] for g in binned_gen[1:]], labels=labs_gen)
+    sns.stripplot(data=[[h[2] for h in g] for g in binned_gen[1:]], ax=axes_c, jitter=0.4)
+    sns.despine()
+
+    axes_a.set_xticklabels(labs_vs)
+    axes_b.set_xticklabels(labs_time)
+    axes_c.set_xticklabels(labs_gen)
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='subtree_analysis')
-    ptr.show()
+    ptr.savefig(fname='sec_cases_' + j + '_' + f)
+    # ptr.show()
 
     ptr.close("all")
 
+
+    ptr.figure(figsize=(14,10), dpi=100)
+
+    length = 5
+    width = 4
+
+    size = length * width
+
+    v_max = 500
+    j_add = v_max / size
+    i_add = width * j_add
+    
+    count = 1
+    for i in range(5):
+        for h in range(4):
+            lower = i_add*i + j_add*h
+            upper = i_add*i + j_add*(h+1)
+
+            ax = ptr.subplot2grid((5,4), (i,h), title='Donor V0 range: ' + str(int(lower)) + ' - ' + str(int(upper)), xlabel='# Secondary cases', ylim=(0,1))
+            ax.hist([h[2] for h in binned_init_vs[count]],bins=range(0,11),density=True, )
+            count += 1
+
+
+    ptr.tight_layout()
+
+    ptr.savefig(fname='sec_cases_raw_dist_' + j + '_' + f)
+    ptr.show()
+
+
     # GROWTH FACTOR
 
-    ptr.figure(figsize=(7,10), dpi=100)
+    ptr.figure(figsize=(14,10), dpi=100)
 
     axes_a = ptr.subplot(311, title='Effect of V0 of root node on subtree growth factor', xlim=(0,500))
     axes_a.set_ylabel("Growth factor")
@@ -934,14 +1046,14 @@ for j, d, col, per, s in z:
     axes_c.set_ylabel("Growth factor")
     axes_c.set(xlabel="Generation")
 
-    axes_a.scatter(init_vs,GFs, c=col, alpha=0.3)
-    axes_b.scatter(times,GFs, c=col, alpha=0.3)
-    axes_c.scatter(generations,GFs, c=col, alpha=0.3)
+    axes_a.scatter(init_vs,GFs, alpha=0.3)
+    axes_b.scatter(times,GFs, alpha=0.3)
+    axes_c.scatter(generations,GFs, alpha=0.3)
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='subtree_analysis')
-    ptr.show()
+    ptr.savefig(fname='GF_' + j + '_' + f)
+    # ptr.show()
 
     ptr.close("all")
 
@@ -989,8 +1101,121 @@ for j, d, col, per, s in z:
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='subtree_colour_analysis')
-    ptr.show()
+    # ptr.savefig(fname='subtree_colour_analysis')
+    # ptr.show()
+
+    ptr.close("all")
+
+
+    # GI striplot
+
+    ptr.figure(figsize=(14,10), dpi=100)
+
+    axes_a = ptr.subplot(311, title='Effect of V0 of root node on generation interval')
+    axes_a.set_ylabel("Generation interval (days)")
+    axes_a.set(xlabel="Initial Viral Load")
+
+    axes_b = ptr.subplot(312, title='Effect of time on generation interval')
+    axes_b.set_ylabel("Generation interval (days)")
+    axes_b.set(xlabel="Days")
+
+    axes_c = ptr.subplot(313, title='Effect of generation on generation interval')
+    axes_c.set_ylabel("Generation interval (days)")
+    axes_c.set(xlabel="Generation")
+
+    labs_vs = [str(int(bins_vs[h-1])) + '-' + str(int(bins_vs[h])) for h in range(1,len(bins_vs))]
+    labs_time = [str(int(bins_time[h-1])) + '-' + str(int(bins_time[h])) for h in range(1,len(bins_time))]
+    labs_gen = [str(int(bins_gen[h-1])) + '-' + str(int(bins_gen[h])) for h in range(1,len(bins_gen))]
+
+    sns.stripplot(data=[[a for h in g for a in h[7]] for g in binned_init_vs[1:]], ax=axes_a, jitter=0.4)
+    sns.despine()
+
+    sns.stripplot(data=[[a for h in g for a in h[7]] for g in binned_time[1:]], ax=axes_b, jitter=0.4)
+    sns.despine()
+
+    sns.stripplot(data=[[a for h in g for a in h[7]] for g in binned_gen[1:]], ax=axes_c, jitter=0.4)
+    sns.despine()
+
+    axes_a.set_xticklabels(labs_vs)
+    axes_b.set_xticklabels(labs_time)
+    axes_c.set_xticklabels(labs_gen)
+
+    ptr.tight_layout()
+
+    ptr.savefig(fname='GI_sp_' + j + '_' + f)
+    # ptr.show()
+
+    # GI scatterplot
+
+    ptr.figure(figsize=(14,10), dpi=100)
+
+    axes_a = ptr.subplot(311, title='Effect of V0 of root node on generation interval')
+    axes_a.set_ylabel("Generation interval (days)")
+    axes_a.set(xlabel="Initial Viral Load")
+
+    axes_b = ptr.subplot(312, title='Effect of time on generation interval')
+    axes_b.set_ylabel("Generation interval (days)")
+    axes_b.set(xlabel="Days")
+
+    axes_c = ptr.subplot(313, title='Effect of generation on generation interval')
+    axes_c.set_ylabel("Generation interval (days)")
+    axes_c.set(xlabel="Generation")
+
+    axes_a.scatter(init_vs_parents,GIs)
+
+    sns.stripplot(data=[[a for h in g for a in h[7]] for g in binned_time[1:]], ax=axes_b, jitter=0.4)
+    sns.despine()
+
+    sns.stripplot(data=[[a for h in g for a in h[7]] for g in binned_gen[1:]], ax=axes_c, jitter=0.4)
+    sns.despine()
+
+    axes_b.set_xticklabels(labs_time)
+    axes_c.set_xticklabels(labs_gen)
+
+    ptr.tight_layout()
+
+    ptr.savefig(fname='GI_scatter_' + j + '_' + f)
+    # ptr.show()
+
+    ptr.close("all")
+
+    # EXP striplot
+
+    ptr.figure(figsize=(14,10), dpi=100)
+
+    axes_a = ptr.subplot(311, title='Effect of V0 of root node on exposure period')
+    axes_a.set_ylabel("Exposure period (days)")
+    axes_a.set(xlabel="Initial Viral Load")
+
+    axes_b = ptr.subplot(312, title='Effect of time on exposure period')
+    axes_b.set_ylabel("Exposure period (days)")
+    axes_b.set(xlabel="Days")
+
+    axes_c = ptr.subplot(313, title='Effect of generation exposure period')
+    axes_c.set_ylabel("Exposure period (days)")
+    axes_c.set(xlabel="Generation")
+
+    labs_vs = [str(int(bins_vs[h-1])) + '-' + str(int(bins_vs[h])) for h in range(1,len(bins_vs))]
+    labs_time = [str(int(bins_time[h-1])) + '-' + str(int(bins_time[h])) for h in range(1,len(bins_time))]
+    labs_gen = [str(int(bins_gen[h-1])) + '-' + str(int(bins_gen[h])) for h in range(1,len(bins_gen))]
+
+    sns.stripplot(data=[[h[6] for h in g] for g in binned_init_vs[1:]], ax=axes_a, jitter=0.4)
+    sns.despine()
+
+    sns.stripplot(data=[[h[6] for h in g] for g in binned_time[1:]], ax=axes_b, jitter=0.4)
+    sns.despine()
+
+    sns.stripplot(data=[[h[6] for h in g] for g in binned_gen[1:]], ax=axes_c, jitter=0.4)
+    sns.despine()
+
+    axes_a.set_xticklabels(labs_vs)
+    axes_b.set_xticklabels(labs_time)
+    axes_c.set_xticklabels(labs_gen)
+
+    ptr.tight_layout()
+
+    ptr.savefig(fname='exp_sp_' + j + '_' + f)
+    # ptr.show()
 
     ptr.close("all")
     
@@ -1002,7 +1227,7 @@ for j, d, col, per, s in z:
 
     size = length * width
 
-    time_max = 60
+    time_max = 180
     j_add = time_max / size
     i_add = width * j_add
     
@@ -1049,7 +1274,7 @@ for j, d, col, per, s in z:
 
             labs_vs = [str(int(bins_vs[h-1])) for h in range(1,len(bins_vs))]
 
-            ax = ptr.subplot2grid((3,4), (i,h), title='Days: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r) + ', $\\rho$ = ' + str(spear_r) + ' (' + str(spear_r_p) + ')', ylabel='Subtree size', xlabel='Root node V0',ylim=(0.1,1000), yscale='log')
+            ax = ptr.subplot2grid((3,4), (i,h), title='Days: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r) + ', $\\rho$ = ' + str(spear_r) + ' (' + str(spear_r_p) + ')', ylabel='Subtree size', xlabel='Root node V0',ylim=(0.1,10000), yscale='log')
             # ax = ptr.subplot2grid((3,4), (i,h), title='Time (days) range: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r), ylabel='Mean path length', xlabel='Root node V0', xlim=(0,500),ylim=(-1,15))
             # ax = ptr.subplot2grid((3,4), (i,h), title='Time (days) range: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r), ylabel='Secondary cases', xlabel='Root node V0', xlim=(0,500),ylim=(-1,15))
             # ax.scatter(init_vs,sizes, c=col, alpha=0.3)
@@ -1059,8 +1284,8 @@ for j, d, col, per, s in z:
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='hist_size')
-    ptr.show()
+    ptr.savefig(fname='binned_size_bw_' + j + '_' + f)
+    # ptr.show()
 
     ptr.close("all")
 
@@ -1071,7 +1296,7 @@ for j, d, col, per, s in z:
 
     size = length * width
 
-    time_max = 60
+    time_max = 180
     j_add = time_max / size
     i_add = width * j_add
     
@@ -1126,8 +1351,8 @@ for j, d, col, per, s in z:
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='hist_len')
-    ptr.show()
+    ptr.savefig(fname='binned_len_gen_bw_' + j + '_' + f)
+    # ptr.show()
 
     ptr.close("all")
 
@@ -1138,7 +1363,7 @@ for j, d, col, per, s in z:
 
     size = length * width
 
-    time_max = 60
+    time_max = 180
     j_add = time_max / size
     i_add = width * j_add
     
@@ -1193,8 +1418,8 @@ for j, d, col, per, s in z:
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='hist_sec')
-    ptr.show()
+    ptr.savefig(fname='binned_sec_cases_bw_' + j + '_' + f)
+    # ptr.show()
 
 
     ptr.close("all")
@@ -1206,7 +1431,7 @@ for j, d, col, per, s in z:
 
     size = length * width
 
-    time_max = 60
+    time_max = 180
     j_add = time_max / size
     i_add = width * j_add
     
@@ -1254,18 +1479,20 @@ for j, d, col, per, s in z:
             # labs_vs = [str(int(bins_vs[h-1])) + '-' + str(int(bins_vs[h])) for h in range(1,len(bins_vs))]
             labs_vs = [str(int(bins_vs[h-1])) for h in range(1,len(bins_vs))]
 
-            ax = ptr.subplot2grid((3,4), (i,h), title='Days: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r) + ', $\\rho$ = ' + str(spear_r) + ' (' + str(spear_r_p) + ')', ylabel='Subtree size', xlabel='Root node V0',ylim=(0.1,1000), yscale='log')
+            ax = ptr.subplot2grid((3,4), (i,h), title='Days: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r) + ', $\\rho$ = ' + str(spear_r) + ' (' + str(spear_r_p) + ')', ylabel='Subtree size', xlabel='Root node V0',ylim=(0.1,10000), yscale='log')
             # ax = ptr.subplot2grid((3,4), (i,h), title='Time (days) range: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r), ylabel='Mean path length', xlabel='Root node V0', xlim=(0,500),ylim=(-1,15))
             # ax = ptr.subplot2grid((3,4), (i,h), title='Time (days) range: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r), ylabel='Secondary cases', xlabel='Root node V0', xlim=(0,500),ylim=(-1,15))
             # ax.scatter(init_vs,sizes, c=col, alpha=0.3)
-            ax.boxplot([[h[0] for h in g] for g in binned_init_vs[1:]], labels=labs_vs)
+            # ax.boxplot([[h[0] for h in g] for g in binned_init_vs[1:]], labels=labs_vs)
+            sns.stripplot(data=[[h[0] for h in g] for g in binned_init_vs[1:]], ax=ax, jitter=0.4)
+            ax.set_xticklabels(labs_vs)
             ptr.xticks(fontsize=8)
 
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='hist_size')
-    ptr.show()
+    ptr.savefig(fname='binned_size_sp_' + j + '_' + f)
+    # ptr.show()
 
     ptr.close("all")
 
@@ -1276,7 +1503,7 @@ for j, d, col, per, s in z:
 
     size = length * width
 
-    time_max = 60
+    time_max = 180
     j_add = time_max / size
     i_add = width * j_add
     
@@ -1325,14 +1552,16 @@ for j, d, col, per, s in z:
             ax = ptr.subplot2grid((3,4), (i,h), title='Days: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r) + ', $\\rho$ = ' + str(spear_r) + ' (' + str(spear_r_p) + ')', ylabel='Mean path length', xlabel='Root node V0',ylim=(-1,15))
             # ax = ptr.subplot2grid((3,4), (i,h), title='Time (days) range: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r), ylabel='Secondary cases', xlabel='Root node V0', xlim=(0,500),ylim=(-1,15))
             # ax.scatter(init_vs,lengths, c=col, alpha=0.3)
-            ax.boxplot([[h[1] for h in g] for g in binned_init_vs[1:]], labels=labs_vs)
+            # ax.boxplot([[h[1] for h in g] for g in binned_init_vs[1:]], labels=labs_vs)
+            sns.stripplot(data=[[h[1] for h in g] for g in binned_init_vs[1:]], ax=ax, jitter=0.4)
+            ax.set_xticklabels(labs_vs)
             ptr.xticks(fontsize=8)
 
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='hist_len')
-    ptr.show()
+    ptr.savefig(fname='binned_len_gen_sp_' + j + '_' + f)
+    # ptr.show()
 
     ptr.close("all")
 
@@ -1343,7 +1572,7 @@ for j, d, col, per, s in z:
 
     size = length * width
 
-    time_max = 60
+    time_max = 180
     j_add = time_max / size
     i_add = width * j_add
     
@@ -1392,14 +1621,16 @@ for j, d, col, per, s in z:
             # ax = ptr.subplot2grid((3,4), (i,h), title='Time (days) range: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r), ylabel='Mean path length', xlabel='Root node V0', xlim=(0,500),ylim=(-1,15))
             ax = ptr.subplot2grid((3,4), (i,h), title='Days: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r) + ', $\\rho$ = ' + str(spear_r) + ' (' + str(spear_r_p) + ')', ylabel='Secondary cases', xlabel='Root node V0',ylim=(-1,15))
             # ax.scatter(init_vs,sec_cases, c=col, alpha=0.3)
-            ax.boxplot([[h[2] for h in g] for g in binned_init_vs[1:]], labels=labs_vs)
+            # ax.boxplot([[h[2] for h in g] for g in binned_init_vs[1:]], labels=labs_vs)
+            sns.stripplot(data=[[h[2] for h in g] for g in binned_init_vs[1:]], ax=ax, jitter=0.4)
+            ax.set_xticklabels(labs_vs)
             ptr.xticks(fontsize=8)
 
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='hist_sec')
-    ptr.show()
+    ptr.savefig(fname='binned_sec_cases_sp_' + j + '_' + f)
+    # ptr.show()
 
 
     ptr.close("all")
@@ -1411,7 +1642,7 @@ for j, d, col, per, s in z:
 
     size = length * width
 
-    time_max = 60
+    time_max = 180
     j_add = time_max / size
     i_add = width * j_add
     
@@ -1457,14 +1688,14 @@ for j, d, col, per, s in z:
             # ax = ptr.subplot2grid((3,4), (i,h), title='Time (days) range: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r), ylabel='Mean path length', xlabel='Root node V0', xlim=(0,500),ylim=(-1,15))
             # ax = ptr.subplot2grid((3,4), (i,h), title='Time (days) range: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r), ylabel='Secondary cases', xlabel='Root node V0', xlim=(0,500),ylim=(-1,15))
             ax = ptr.subplot2grid((3,4), (i,h), title='Days: ' + str(int(lower)) + ' - ' + str(int(upper)) + ', r = ' + str(pear_r) + ', $\\rho$ = ' + str(spear_r) + ' (' + str(spear_r_p) + ')', ylabel='Growth factor', xlabel='Root node V0', xlim=(0,500),ylim=(-1,10))
-            ax.scatter(init_vs,GFs, c=col, alpha=0.3)
+            ax.scatter(init_vs,GFs, alpha=0.3)
             
 
 
     ptr.tight_layout()
 
-    ptr.savefig(fname='hist_GF')
-    ptr.show()
+    ptr.savefig(fname='binned_GF_' + j + '_' + f)
+    # ptr.show()
 
 
 
